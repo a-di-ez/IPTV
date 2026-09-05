@@ -10,6 +10,8 @@ This script maps every URL back to its channel and list, probes each one several
 times, and separates the cases that look alike from the outside:
 
   dead         every attempt said "not found", so the stream is really gone
+  stubbed      the server served a playlist, but the only thing in it is a
+               placeholder clip - an error card standing in for the channel
   disputed     looked dead over HTTP, but ffprobe found a real audio/video stream
                behind it - needs a human, not a bot, to decide
   blocked      the server answered but refused us, which is what a channel served
@@ -18,8 +20,9 @@ times, and separates the cases that look alike from the outside:
   flaky        answered at least once, so it is up but unreliable from here
   alive        answered every time
 
-Only `dead` is safe to act on without a second opinion. `blocked` in particular must
-not be treated as a fault: the lists mark geo-blocked channels deliberately.
+Only `dead` and `stubbed` are safe to act on without a second opinion. `blocked` in
+particular must not be treated as a fault: the lists mark geo-blocked channels
+deliberately.
 
 Both playlist formats used by the lists are understood, HLS (.m3u8) and MPEG-DASH
 (.mpd), so a DASH stream is not mistaken for a broken one. Neither check is airtight
@@ -28,6 +31,16 @@ behind it plays, and a payload ffprobe can decode is not proof it is a live chan
 rather than a stray media fragment sitting at a familiar-looking URL - one such
 fragment is what first prompted the --confirm-dead option below. Treat `dead` as
 "nothing here answered like a stream, twice, two different ways" rather than proof.
+
+`stubbed` exists because those two checks share a blind spot, and 13 channels sat in
+the Ukrainian list for months because of it. A CDN whose token has expired need not
+answer 403: cdnua05.hls.tv answered 200 with a manifest that parsed cleanly and whose
+one segment was `/stub_55x/token.ts`, a card reading "недоступний токен". The header
+check saw `#EXTM3U` and said alive; ffprobe, asked for a second opinion, decoded the
+card and reported healthy 1280x720 video - because an error card *is* real video. No
+check that stops at the manifest, or that only asks "does something decode", can tell
+those apart. Reading the segment names inside the manifest can, so HLS playlists are
+now opened one level deeper.
 
 With --confirm-dead, every channel that looks `dead` over HTTP gets a second,
 independent opinion from `ffprobe` (part of ffmpeg) before being reported as dead:
@@ -61,6 +74,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
@@ -83,15 +97,22 @@ USER_AGENT = (
 
 OK = "ok"
 GONE = "gone"
+STUB = "stub"
 REFUSED = "refused"
 UNREACHABLE = "unreachable"
 
 ALIVE = "alive"
 DEAD = "dead"
+STUBBED = "stubbed"
 DISPUTED = "disputed"
 BLOCKED = "blocked"
 UNREACHED = "unreachable"
 FLAKY = "flaky"
+
+# a segment named after a failure rather than after a time or a sequence number.
+# Matched against the segment's path only, never its query: a real segment URL
+# routinely carries `?token=...` and must not be read as a placeholder.
+PLACEHOLDER = re.compile(r"stub|placeholder|no[_-]?signal|offline|unavailable|blocked|error")
 
 # a channel served only in its own country answers, then refuses us
 REFUSING_CODES = (401, 402, 403, 451)
@@ -124,8 +145,13 @@ def looks_like_a_playlist(head):
     return "<MPD" in text[:2000]
 
 
-def probe(url, timeout):
-    """Open `url` once and report what the server did."""
+def read_head(url, timeout, limit=8000):
+    """Open `url` once and return `(outcome, the first bytes of the body)`.
+
+    The outcome is OK whenever the server gave us a body at all - "something
+    answered", not yet "this is a playlist" - and GONE/REFUSED/UNREACHABLE when it
+    did not, in which case the body is empty.
+    """
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     # a stream whose certificate does not verify is still a working stream
     context = ssl.create_default_context()
@@ -133,19 +159,66 @@ def probe(url, timeout):
     context.verify_mode = ssl.CERT_NONE
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
-            head = response.read(3000).decode("utf-8", "ignore")
+            return OK, response.read(limit).decode("utf-8", "ignore")
     except urllib.error.HTTPError as error:
         if error.code in GONE_CODES:
-            return GONE
+            return GONE, ""
         if error.code in REFUSING_CODES:
-            return REFUSED
-        return UNREACHABLE
+            return REFUSED, ""
+        return UNREACHABLE, ""
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
         # http.client.HTTPException covers a server that started a chunked
         # response and then hung up mid-chunk (IncompleteRead) and similar
         # low-level protocol violations - a broken connection, not a bad URL
-        return UNREACHABLE
-    return OK if looks_like_a_playlist(head) else GONE
+        return UNREACHABLE, ""
+
+
+def playlist_entries(body):
+    """The non-comment lines of an HLS playlist: its variants, or its segments."""
+    return [line.strip() for line in body.splitlines() if line.strip() and not line.startswith("#")]
+
+
+def serves_a_placeholder(url, body, timeout):
+    """Return True if the HLS playlist at `url` offers nothing but a placeholder.
+
+    Two signatures count, and the `/stub_55x/token.ts` card described in the module
+    docstring trips both: a segment path named after a failure, and a playlist whose
+    segments are all the same file, which no live channel produces.
+
+    A master playlist lists variants rather than segments, so the placeholder sits
+    one level down and this follows the first variant to find it. When that second
+    request fails the answer is False: not being able to look is not evidence of a
+    stub, and this must never be the reason a working channel is called broken.
+    """
+    entries = playlist_entries(body)
+    if not entries:
+        return False
+    variant = next((entry for entry in entries if ".m3u8" in entry or ".m3u" in entry), None)
+    if variant is not None:
+        outcome, body = read_head(urllib.parse.urljoin(url, variant), timeout)
+        if outcome != OK or not body.lstrip().startswith("#EXTM3U"):
+            return False
+        entries = playlist_entries(body)
+        if not entries:
+            return False
+    paths = [urllib.parse.urlsplit(entry).path.lower() for entry in entries]
+    if any(PLACEHOLDER.search(path) for path in paths):
+        return True
+    return len(entries) > 1 and len(set(entries)) == 1
+
+
+def probe(url, timeout):
+    """Open `url` once and report what the server did."""
+    outcome, head = read_head(url, timeout)
+    if outcome != OK:
+        return outcome
+    if not looks_like_a_playlist(head):
+        return GONE
+    # only HLS is opened a level deeper; a DASH manifest describes its segments
+    # in the XML itself rather than pointing at a list of them
+    if head.lstrip().startswith("#EXTM3U") and serves_a_placeholder(url, head, timeout):
+        return STUB
+    return OK
 
 
 def ffprobe_finds_a_stream(url):
@@ -181,6 +254,10 @@ def classify(outcomes):
         return ALIVE
     if any(outcome == OK for outcome in outcomes):
         return FLAKY
+    # a stub is the server stating the channel will not play, which outranks a
+    # refusal or a timeout: those only say we could not get to it this time
+    if any(outcome == STUB for outcome in outcomes):
+        return STUBBED
     if any(outcome == REFUSED for outcome in outcomes):
         return BLOCKED
     if all(outcome == GONE for outcome in outcomes):
@@ -194,6 +271,10 @@ def check(channel, settings):
     If the channel looks dead and `settings.confirm_dead` is set, give it one more
     chance through ffprobe before reporting it as dead - see the module docstring
     for why this can only pull a verdict out of `dead`, never push one into it.
+
+    A `stubbed` channel is pointedly not offered that second chance. ffprobe decodes
+    a placeholder card as happily as a channel, so asking it here would do nothing
+    but overturn the one check that saw through the stub.
     """
     name, url = channel
     outcomes = []
@@ -234,7 +315,12 @@ def check_all(names, settings):
 
 
 def report(name, results, attempts):
-    """Print the results of one list and return how many channels are dead."""
+    """Print the results of one list and return how many channels are provably broken.
+
+    Provably broken is `dead` plus `stubbed`: both are the server telling us the
+    channel is not there, unlike a refusal or a timeout, which only describe the
+    trip. Those two are what the exit code is for.
+    """
     states = {}
     for _, _, state, _ in results:
         states[state] = states.get(state, 0) + 1
@@ -245,7 +331,7 @@ def report(name, results, attempts):
             continue
         detail = "/".join(outcomes) if state != FLAKY else f"{outcomes.count(OK)}/{attempts} ok"
         print(f"  {state:12} {channel} [{detail}] -> {url}")
-    return states.get(DEAD, 0)
+    return states.get(DEAD, 0) + states.get(STUBBED, 0)
 
 
 def as_records(list_name, results, checked_at, confirm_dead):
@@ -318,12 +404,12 @@ def main():
 
     results_by_list = check_all(names, settings)
 
-    dead_total = sum(report(name, results_by_list[name], args.attempts) for name in names)
+    broken_total = sum(report(name, results_by_list[name], args.attempts) for name in names)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
             write_json_records(handle, names, results_by_list, checked_at, args.confirm_dead)
 
-    return 1 if dead_total else 0
+    return 1 if broken_total else 0
 
 
 if __name__ == "__main__":
